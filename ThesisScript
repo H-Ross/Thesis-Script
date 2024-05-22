@@ -1,0 +1,176 @@
+#!/bin/bash
+
+# ANSI color codes
+BLUE='\033[0;34m'
+YELLOW='\033[0;33m'
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+PURPLE='\033[0;35m'
+NC='\033[0m' # No Color
+
+# Function to display section headers without color
+display_section_header() {
+    echo "---------------------------------------------"
+    echo "$1"
+    echo "---------------------------------------------"
+}
+
+# Function to display container information with colors
+display_container_info() {
+    echo "Container ID: $1"
+    echo -e "Runtime: ${BLUE}$2${NC}"
+    echo -e "Privileged: ${3:+$3}"
+    echo -e "AppArmor: ${4:+$4}"
+    echo -e "PidMode: ${5:+$5}"
+    echo "Mounts:"
+    echo -e "${YELLOW}$6${NC}"
+    echo "Capabilities:"
+    echo -e "${YELLOW}$7${NC}"
+    echo "Vulnerabilities:"
+    echo -e "\nTotal Vulnerabilities: $9"
+    echo -e "${RED}Critical${NC} Vulnerabilities: ${10}"
+    echo -e "${YELLOW}High${NC} Vulnerabilities: ${11}"
+    echo -e "${BLUE}Medium${NC} Vulnerabilities: ${12}"
+    echo -e "${GREEN}Low${NC} Vulnerabilities: ${13}"
+    echo -e "${PURPLE}Unknown${NC} Vulnerabilities: ${14}"
+    echo "---------------------------------------------"
+}
+
+# Check if the correct number of arguments is provided
+if [ "$#" -lt 2 ]; then
+    echo "Usage: $0 <runtime> <policy_json_file>"
+    exit 1
+fi
+
+runtime="$1"
+policy_file="$2"
+
+# Check if the policy file exists
+if [ ! -f "$policy_file" ]; then
+    echo "Policy file not found: $policy_file"
+    exit 1
+fi
+
+# Parse the policy JSON file and extract necessary variables
+#privilegedPolicy=$(jq -r '.privileged' "$policy_file")
+#apparmorPolicy=$(jq -r '.apparmorEnabled' "$policy_file")
+#pidModePolicy=$(jq -r '.pidMode' "$policy_file")
+capabilitiesPolicy=$(jq -r '.capabilities | join(",")' "$policy_file")
+mountsPolicy=$(jq -r '.mounts | join(",")' "$policy_file")
+
+# Determine OCI runtime for Podman and AppArmor check command
+if [ "$runtime" == "podman" ]; then
+    ociRuntime="--format='{{.OCIRuntime}}'"
+    apparmorCommand="cat /proc/self/attr/current"
+    pidModeCommand="podman inspect --format='{{.HostConfig.PidMode}}' $container_id"
+    listCommand="podman ps -q"
+else
+    ociRuntime="--format='{{.HostConfig.Runtime}}'"
+    apparmorCommand="cat /proc/self/attr/current"
+    pidModeCommand="docker inspect --format='{{.HostConfig.PidMode}}' $container_id"
+    listCommand="docker ps -q"
+fi
+
+# Get a list of running container IDs
+container_ids=$($listCommand)
+
+# Iterate over each running container
+for container_id in $container_ids; do
+    display_section_header "Inspecting container $container_id"
+
+    # Check if the container exists
+    if "$runtime" inspect "$container_id" &>/dev/null; then
+        # Get container runtime
+        runtime_name=$("$runtime" inspect "$ociRuntime" "$container_id")
+
+        # Check if the container is privileged
+        privileged=$("$runtime" inspect --format='{{.HostConfig.Privileged}}' "$container_id")
+        if [ "$privileged" = "true" ]; then
+            privileged_status="${RED}Yes${NC}"
+        else
+            privileged_status="${GREEN}No${NC}"
+        fi
+
+	# Get the SecurityOpt settings of the container
+	security_opt="$("$runtime" inspect --format='{{.HostConfig.SecurityOpt}}' "$container_id")"
+
+	# Check if AppArmor is enabled
+	if echo "$security_opt" | grep -q 'apparmor=unconfined'; then
+    		apparmor_status="${RED}Disabled${NC}"
+	else
+    		apparmor_status="${GREEN}Enabled${NC}"
+	fi
+
+    # Get container PidMode
+    pidMode=$("$runtime" inspect --format='{{.HostConfig.PidMode}}' "$container_id")
+    if [ "$pidMode" == "host" ]; then
+        pid_mode_status="${RED}Host${NC}"
+    else
+        pid_mode_status="${GREEN}Not Host${NC}"
+    fi
+
+    # Get container mounts
+    mounts=$("$runtime" inspect --format='{{range .Mounts}}{{.Source}}:{{.Destination}}{{println}}{{end}}' "$container_id")    
+    mounts_match=true
+
+    # Check mounts against policy
+    for mount in $(echo "$mounts" | tr ',' '\n'); do
+        # Check if the container has this mount
+        if ! echo "$mountsPolicy" | grep -q "$mount"; then
+            mounts_match=false
+        fi
+    done
+
+    # Get container capabilities
+    capabilities=$("$runtime" inspect --format='{{range .HostConfig.CapAdd}}{{.}}{{"\n"}}{{end}}' "$container_id")
+    capabilities_match=true
+
+    # Check capabilities against policy
+    for cap in $(echo "$capabilities" | tr ',' '\n'); do
+        # Check if the container has this capability
+        if ! echo "$capabilitiesPolicy" | grep -q "$cap"; then
+           capabilities_match=false
+        fi
+    done
+
+    # Get container image name
+    image_name=$("$runtime" inspect --format='{{.Config.Image}}' "$container_id")
+
+    # Perform vulnerability scanning using Trivy
+    vulnerabilities=$(trivy image --format=json "$image_name" 2>/dev/null | jq -r '.Results[].Vulnerabilities[].Severity')
+
+
+        if [ -z "$vulnerabilities" ]; then
+            vulnerabilities_info="No vulnerabilities found"
+            total_vulnerabilities=0
+            critical_vulnerabilities=0
+            high_vulnerabilities=0
+            medium_vulnerabilities=0
+            low_vulnerabilities=0
+            unknown_vulnerabilities=0
+        else
+            # Extract and display basic information about the vulnerabilities found
+            vulnerabilities_info="$vulnerabilities"
+            # Count vulnerabilities by severity
+            total_vulnerabilities=$(echo "$vulnerabilities_info" | wc -l)
+            critical_vulnerabilities=$(echo "$vulnerabilities_info" | grep -c "CRITICAL")
+            high_vulnerabilities=$(echo "$vulnerabilities_info" | grep -c "HIGH")
+            medium_vulnerabilities=$(echo "$vulnerabilities_info" | grep -c "MEDIUM")
+            low_vulnerabilities=$(echo "$vulnerabilities_info" | grep -c "LOW")
+            unknown_vulnerabilities=$((total_vulnerabilities - critical_vulnerabilities - high_vulnerabilities - medium_vulnerabilities - low_vulnerabilities))
+        fi
+
+        # Display container information
+        display_container_info "$container_id" "$runtime_name" "$privileged_status" "$apparmor_status" "$pid_mode_status" "$mounts" "$capabilities" "$vulnerabilities_info" "$total_vulnerabilities" "$critical_vulnerabilities" "$high_vulnerabilities" "$medium_vulnerabilities" "$low_vulnerabilities" "$unknown_vulnerabilities"
+    else
+        echo "Container $container_id does not exist"
+    fi
+
+    # Check if container's configurations are secure
+    if [ "$privileged" != "true" ] && [ "$pidMode" != "host" ] && $capabilities_match && [[ "$security_opt" != *"apparmor=unconfined"* ]] && $mounts_match && [ "$high_vulnerabilities" -eq 0 ] && [ "$critical_vulnerabilities" -eq 0 ]; then
+        echo -e "Security Status: ${GREEN}Secure${NC}"
+    else
+        echo -e "Security Status: ${RED}Unsecure${NC}"
+    fi
+done
+
